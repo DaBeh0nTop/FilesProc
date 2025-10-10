@@ -90,6 +90,13 @@
     <table class="table" id="skinTable"></table>
     <div class="kpi" id="skinKpi"></div>
   </div>
+
+  <!-- NEW: V2L Summary -->
+  <div class="card">
+    <h2>V2L Summary</h2>
+    <table class="table" id="v2lTable"></table>
+    <div class="kpi" id="v2lKpi"></div>
+  </div>
 </div>
 
 <script>
@@ -111,6 +118,161 @@ const previewBtn=document.getElementById('previewBtn');
 const downloadBtn=document.getElementById('downloadBtn');
 const downloadRemainBtn=document.getElementById('downloadRemainBtn');
 const previewBox=document.getElementById('previewBox');
+
+let rawText='',parsed=[],valid=[],selection=[],remaining=[];
+
+fileInput.addEventListener('change',async()=>{
+  const f=fileInput.files?.[0];
+  if(!f){fileMeta.textContent='No file selected';rawText='';return;}
+  fileMeta.textContent=`Selected: ${f.name} — ${(f.size/1024).toFixed(1)} KB`;
+  rawText=await f.text();
+  if(!outNameEl.value)outNameEl.value=f.name.replace(/\.[^.]+$/,'')||'selection';
+});
+
+// Tier normalization
+const TIER_ORDER=['WORLD COLLECTOR','MEGA COLLECTOR','EXALTED COLLECTOR','RENOWNED COLLECTOR','EXPERT COLLECTOR','AMATEUR COLLECTOR','JUNIOR COLLECTOR','NO TIER'];
+function normalizeTier(s){
+  if(!s)return'NO TIER';
+  const t=s.trim().toLowerCase().replace(/\b(i|ii|iii|iv|v)\b$/,'').replace(/\s+/g,' ');
+  if(t.startsWith('world'))return'WORLD COLLECTOR';
+  if(t.startsWith('mega'))return'MEGA COLLECTOR';
+  if(t.startsWith('exalted'))return'EXALTED COLLECTOR';
+  if(t.startsWith('renowned'))return'RENOWNED COLLECTOR';
+  if(t.startsWith('expert'))return'EXPERT COLLECTOR';
+  if(t.startsWith('seasoned')||t.startsWith('amateur'))return'AMATEUR COLLECTOR';
+  if(t.startsWith('junior')||t.startsWith('new'))return'JUNIOR COLLECTOR';
+  return'NO TIER';
+}
+function abbrTier(t){
+  const c=normalizeTier(t);
+  const map={'WORLD COLLECTOR':'World Coll','MEGA COLLECTOR':'Mega Coll','EXALTED COLLECTOR':'Exalted Coll','RENOWNED COLLECTOR':'Renowned Coll','EXPERT COLLECTOR':'Expert Coll','AMATEUR COLLECTOR':'Amateur Coll','JUNIOR COLLECTOR':'Junior Coll','NO TIER':'No Tier'};
+  return map[c]||c;
+}
+
+// V2L normalization
+function normalizeV2L(s){
+  if(!s)return'Unknown';
+  const t=String(s).trim().toLowerCase();
+  if(/^(yes|on|true|1)$/i.test(t))return'On';
+  if(/^(no|off|false|0)$/i.test(t))return'Off';
+  return'Unknown';
+}
+
+// Parser
+const HEADER_RE=/^\s*\d+\s*[\.\)\-]?\s*[^\s:]+@[^:\s]+\s*:/;
+function parseAccounts(txt){
+  const lines=txt.split(/\r?\n/),records=[];let cur=[];
+  function push(){
+    if(!cur.length)return;
+    const block=cur.join('\n');
+    const email=(block.match(/^\s*\d+\s*[\.\)\-]?\s*([^:\s]+@[^:\s]+)\s*:/m)||[])[1]||null;
+    const status=((block.match(/^\s*Status:\s*(.+)$/mi)||[])[1]||'').trim();
+    const level=+( (block.match(/^\s*Level:\s*(\d+)/mi)||[])[1]??-1);
+    const skins=+( (block.match(/^\s*Skins:\s*(\d+)/mi)||[])[1]??-1);
+    const tierRaw=((block.match(/^\s*Collector\s+Tier:\s*(.+)$/mi)||[])[1]||'NO TIER').trim();
+    const tier=normalizeTier(tierRaw);
+    const v2lRaw=((block.match(/^\s*V2L:\s*(.+)$/mi)||[])[1]||'').trim();
+    const v2l=normalizeV2L(v2lRaw || 'No'); // default to Off if omitted in your dumps
+    records.push({raw:block,email,status,level,skins,tier,v2l});
+    cur=[];
+  }
+  for(const line of lines){if(HEADER_RE.test(line)){push();cur=[line];}else if(cur.length){cur.push(line);} }
+  push();return records;
+}
+
+// Buckets
+function bucketSkins(arr){
+  const ranges=[{label:'0-99',min:0,max:99},{label:'100-199',min:100,max:199},{label:'200-299',min:200,max:299},{label:'300-399',min:300,max:399},{label:'400-499',min:400,max:499},{label:'500-599',min:500,max:599},{label:'600-999',min:600,max:999},{label:'1000+',min:1000,max:Infinity}];
+  const counts=ranges.map(()=>0);
+  for(const a of arr){
+    const s=Number(a.skins);
+    if(!Number.isFinite(s))continue;
+    for(let i=0;i<ranges.length;i++){const r=ranges[i];if(s>=r.min&&s<=r.max){counts[i]++;break;}}
+  }
+  const total=Math.max(1,arr.length);
+  return ranges.map((r,i)=>({range:r.label,count:counts[i],percent:Math.round((counts[i]/total)*100)})).filter(row=>row.count>0);
+}
+function bucketTier(arr){
+  const map=new Map(TIER_ORDER.map(t=>[t,0]));
+  for(const a of arr){const k=normalizeTier(a.tier);map.set(k,(map.get(k)||0)+1);}
+  const total=Math.max(1,arr.length);
+  return TIER_ORDER.map(t=>({tier:t,count:map.get(t)||0,percent:Math.round(((map.get(t)||0)/total)*100)})).filter(x=>x.count>0);
+}
+function bucketV2L(arr){
+  const keys=['On','Off','Unknown'];
+  const map=new Map(keys.map(k=>[k,0]));
+  for(const a of arr){map.set(a.v2l,(map.get(a.v2l)||0)+1);}
+  const total=Math.max(1,arr.length);
+  return keys.map(k=>({state:k,count:map.get(k)||0,percent:Math.round(((map.get(k)||0)/total)*100)})).filter(x=>x.count>0);
+}
+
+// Render helpers
+function renderTable(id,headers,data,key,pct){
+  const table=document.getElementById(id);
+  const head=`<tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr>`;
+  const rows=data.map(d=>`<tr><td>${d[key]}</td><td>${d.count}</td><td>${d[pct]}%</td><td><div class='bar-wrap'><div class='bar-fill' style='width:0%'></div></div></td></tr>`).join('');
+  table.innerHTML=head+rows;
+  requestAnimationFrame(()=>[...table.querySelectorAll('.bar-fill')].forEach((el,i)=>el.style.width=`${data[i][pct]}%`));
+}
+function kpi(id,pairs){document.getElementById(id).innerHTML=pairs.map(([k,v])=>`<span class='pill'>${k}: ${v}</span>`).join('');}
+
+// Helper functions
+function computeSuggestionCount(n){return Math.max(1,Math.round(n*0.16));}
+function makeSelection(arr,n,mode){
+  const a=arr.slice();
+  if(mode==='random'){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}}
+  else if(mode==='skins')a.sort((x,y)=>y.skins-x.skins);
+  else a.sort((x,y)=>y.level-x.level);
+  return a.slice(0,n);
+}
+function downloadTextFile(name,text){const blob=new Blob([text],{type:'text/plain'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);}
+
+// Parse & render
+parseBtn.onclick=()=>{
+  if(!rawText.trim())return alert('Choose a file first.');
+  parsed=parseAccounts(rawText);
+  detectedCountEl.textContent=parsed.length;
+  const needValid=requireValidEl.checked;const minLv=Number(minLevelEl.value)||0;
+  valid=parsed.filter(x=>(!needValid||/valid/i.test(x.status))&&x.level>=minLv);
+  const sugg=computeSuggestionCount(valid.length);
+  validCountEl.textContent=valid.length;suggestCountEl.textContent=`~${sugg}`;selectCountEl.value=sugg;
+
+  // Tiers
+  const tierRows=bucketTier(valid).map(r=>({rank:r.tier,count:r.count,percent:r.percent}));
+  renderTable('accountTable',['Collector Tier','Count','%','Bar'],tierRows,'rank','percent');
+  kpi('accountKpi',[['Detected',parsed.length],['Valid',valid.length],['Top Tier',tierRows[0]?.rank||'—']]);
+
+  // Skins
+  const skinRows=bucketSkins(valid);
+  renderTable('skinTable',['Skin Range','Count','%','Bar'],skinRows,'range','percent');
+  const maxSkins=valid.length?Math.max(...valid.map(a=>a.skins||0)):0;
+  kpi('skinKpi',[['Buckets',skinRows.length],['Peak',`${maxSkins} skins`]]);
+
+  // NEW: V2L
+  const v2lRows=bucketV2L(valid);
+  renderTable('v2lTable',['V2L','Count','%','Bar'],v2lRows,'state','percent');
+  const topV2L=v2lRows.sort((a,b)=>b.count-a.count)[0];
+  kpi('v2lKpi',[['On', (v2lRows.find(x=>x.state==='On')?.count||0)], ['Off', (v2lRows.find(x=>x.state==='Off')?.count||0)], ['Majority', topV2L?`${topV2L.state} (${topV2L.percent}%)`:'—']]);
+
+  dash.classList.remove('hidden');
+};
+
+// Preview & download
+previewBtn.onclick=()=>{
+  if(!valid.length){previewBox.textContent='No accounts match filter.';return;}
+  const n=Math.max(1,+selectCountEl.value||1);
+  selection=makeSelection(valid,n,sortModeEl.value);
+  const lines=selection.map((x,i)=>`[${i+1}] Level ${x.level} | Skins: ${x.skins} | ${x.email||'(no email)'} | ${abbrTier(x.tier)} | V2L: ${x.v2l}\n${x.raw.split(/\r?\n/)[0]}`).join('\n\n');
+  previewBox.textContent=`> FULL PREVIEW\n${lines}\n\nTotal selected: ${selection.length}`;
+  downloadBtn.classList.remove('hidden');
+  if(makeRemainingEl.checked){const chosen=new Set(selection.map(x=>x.raw));remaining=valid.filter(x=>!chosen.has(x.raw));downloadRemainBtn.classList.remove('hidden');}else{remaining=[];downloadRemainBtn.classList.add('hidden');}
+};
+downloadBtn.onclick=()=>{if(!selection.length)return;downloadTextFile((outNameEl.value||'selection')+'.txt',selection.map(x=>x.raw).join('\n---\n'));};
+downloadRemainBtn.onclick=()=>{if(!remaining.length)return;downloadTextFile((outNameEl.value||'selection')+'_remaining.txt',remaining.map(x=>x.raw).join('\n---\n'));};
+clearBtn.onclick=()=>location.reload();
+</script>
+</body>
+</html>const previewBox=document.getElementById('previewBox');
 
 let rawText='',parsed=[],valid=[],selection=[],remaining=[];
 
